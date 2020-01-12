@@ -17,12 +17,7 @@
 
 // Настройки МК
 // Коды цифр семисегментного индикатора
-// static const unsigned int seven_segment_digits[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 static const unsigned int seven_segment_digits[] = {0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90};
-// Значение, записываемое в TCNT1 для генерации прерывания 
-// таймера Т1 по переполнению (срабатывает раз в секунду)
-static unsigned char TCNT1_high = 0xE17B >> 8; // 65536 - 7813 = 57723 (E17B)
-static unsigned char TCNT1_low = 0xE17B && 0xFF; 
 // Переменные для работы с EEPROM
 uint8_t EEMEM eemem_a_min = 0, eemem_a_sec = 0, eemem_b_min = 0, eemem_b_sec = 0;
 
@@ -49,8 +44,6 @@ static unsigned int seconds_spent = 0;
 static unsigned int SEC_PASS = 0;
 // Флаг того, что нужно мигать
 static unsigned int BLINK_ENABLE = 0;
-// Флаг конца игры
-unsigned char end_of_game = 0;
 
 typedef enum
 {
@@ -63,24 +56,87 @@ typedef enum
 // Какие часы будут работать
 static Clock chosen_clock = NO_CLOCK;
 
-
-
-// signed char EEMEM EEMEM_TL = -10, EEMEM_TH = 50;  // Границы в EEPROM
-
-unsigned char i;
-unsigned char R1 = 0, R2 = 0;
-unsigned char n_count = 0;
-
-
-void print_digit(unsigned char digit)
+// Инициализация таймера 0
+void timer0_init(void)
 {
-    PORTA = seven_segment_digits[digit];
+    // Разрешаем прерывания по переполнению
+    TIMSK |= (1 << TOIE0);
+    TCCR0 = (1 << CS02);
 }
 
-void print_number(unsigned int number)
+// Инициализация таймера 1
+void timer1_init(void)
 {
-  R1 = number % 10;
-  R2 = number / 10;
+    // Устанавливаем режим CTC (сброс по совпадению)
+    TCCR1B |= (1 << WGM12);
+    // Разрешаем прерывания по совпадению с OCR1A(H и L)
+    TIMSK |= (1 << OCIE1A);
+
+    // Записываем в регистр число для сравнения
+    OCR1AH = 0x3D09 >> 8; // 15625 = 8 МГц / 256 / 2
+    OCR1AL = 0x3D09 && 0xFF;
+    // Установим предделитель на 256
+    TCCR1B |= (1 << CS12);
+}
+
+// Инициализация портов ввода-вывода  
+void ports_init(void)
+{
+    // Инициализация всего порта А на вывод
+    PORTA=0xFF;
+    DDRA=0xFF;
+
+    // Инициализация всего порта В на вывод 
+    PORTB=0xFF;
+    DDRB=0xFF;
+
+    // Инициализация всего порта С на вывод
+    PORTC=0x00;
+    DDRC=0xFF;
+
+    // Инициализация порта D:
+    // Func7=In Func6=Out Func5=Out Func4=Out Func3=In Func2=In Func1=Out Func0=Out 
+    // State7=T State6=0 State5=1 State4=1 State3=T State2=T State1=1 State0=1 
+    PORTD=0x33;
+    DDRD=0x73; 
+
+    // Инициализация всего порта Е на ввод
+    // Func2=Out Func1=Out Func0=In 
+    PORTE=0x00;
+    DDRE=0x06;
+}
+
+void buttons_init(void)
+{
+    // Разрешаем прерывание INT0, INT1 и INT2
+    GICR |= (1 << INT0) | (1 << INT1) | (1 << INT2);
+    // Генерация сигнала по возрастающему фронту
+    MCUCR |= (1 << ISC00) |
+            (1 << ISC01) |
+            (1 << ISC10) |
+            (1 << ISC11);  
+    MCUCSR |= (1 << ISC2);
+    GIFR = (1 << INTF0) | (1 << INTF1) | (1 << INTF2);
+}
+
+void USART_init(void)
+{
+    // Установка скорости
+    unsigned char speed = F / 16 / BAUD - 1;
+    UBRRH = (speed >> 8);
+    UBRRL = speed;
+    // 8 бит данных, 1 стоп бит, без контроля четности
+    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);
+    // Разрешаем передачу
+    UCSRB = (1 << TXEN);
+}
+
+void game_init()
+{
+    player_b_min = intervals[interval_index] - 1;
+    player_b_sec = SECONDS_IN_MINUTE - 1;
+    player_a_min = intervals[interval_index] - 1;
+    player_a_sec = SECONDS_IN_MINUTE - 1;
 }
 
 // Передача одного байта данных по USART
@@ -356,14 +412,11 @@ ISR(INT2_vect)
     chosen_clock = SEND_RESULT;
     player_a_show = !player_a_show;
 
+    // Выключаем таймер
     TIMSK &= (0 << TOIE0);
 }
 
-// СДЕЛАТЬ НОРМАЛЬНО АКТИВАЦИЮ/ДЕАКТИВАЦИЮ ТАЙМЕРОВ
-// СДЕЛАТЬ НОРМАЛЬНО КОНЕЦ/НАЧАЛО ИГРЫ
-// ОБРАБОТКА СВИТЧА
-
-// 
+// Управление динамической индикацией по переполнению Т0
 ISR(TIMER0_OVF_vect) {
     if (BLINK_ENABLE) {
         if ((!SEC_PASS) && ((chosen_clock == PLAYER_A_CLOCK) || (chosen_clock == PLAYER_B_CLOCK))) {
@@ -448,83 +501,8 @@ ISR (TIMER1_COMPA_vect)
     }
 }
 
-// Инициализация таймера 0
-void timer0_init(void)
-{
-    // Разрешаем прерывания по переполнению
-    TIMSK |= (1 << TOIE0);
-    TCCR0 = (1 << CS02);
-}
-
-// Инициализация таймера 1
-void timer1_init(void)
-{
-    // Устанавливаем режим CTC (сброс по совпадению)
-    TCCR1B |= (1 << WGM12);
-    // Разрешаем прерывания по совпадению с OCR1A(H и L)
-    TIMSK |= (1 << OCIE1A);
-
-    // Записываем в регистр число для сравнения
-    OCR1AH = 0x3D09 >> 8; // 15625 = 8 МГц / 256 / 2
-    OCR1AL = 0x3D09 && 0xFF;
-    // Установим предделитель на 256
-    TCCR1B |= (1 << CS12);
-}
-
-// Инициализация портов ввода-вывода  
-void ports_init(void)
-{
-    // Инициализация всего порта А на вывод
-    PORTA=0xFF;
-    DDRA=0xFF;
-
-    // Инициализация всего порта В на вывод 
-    PORTB=0xFF;
-    DDRB=0xFF;
-
-    // Инициализация всего порта С на вывод
-    PORTC=0x00;
-    DDRC=0xFF;
-
-    // Инициализация порта D:
-    // Func7=In Func6=Out Func5=Out Func4=Out Func3=In Func2=In Func1=Out Func0=Out 
-    // State7=T State6=0 State5=1 State4=1 State3=T State2=T State1=1 State0=1 
-    PORTD=0x33;
-    DDRD=0x73; 
-
-    // Инициализация всего порта Е на ввод
-    // Func2=Out Func1=Out Func0=In 
-    PORTE=0x00;
-    DDRE=0x06;
-}
-
-void buttons_init(void)
-{
-    // Разрешаем прерывание INT0, INT1 и INT2
-    GICR |= (1 << INT0) | (1 << INT1) | (1 << INT2);
-    // Генерация сигнала по возрастающему фронту
-    MCUCR |= (1 << ISC00) |
-            (1 << ISC01) |
-            (1 << ISC10) |
-            (1 << ISC11);  
-    MCUCSR |= (1 << ISC2);
-    GIFR = (1 << INTF0) | (1 << INTF1) | (1 << INTF2);
-}
-
-void USART_init(void)
-{
-    // Установка скорости
-    unsigned char speed = F / 16 / BAUD - 1;
-    UBRRH = (speed >> 8);
-    UBRRL = speed;
-    // 8 бит данных, 1 стоп бит, без контроля четности
-    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0);
-    // Разрешаем передачу
-    UCSRB = (1 << TXEN);
-}
-
 // Проигрывание звука на частоте 2кГц в течениии 4с
-void play_ERROR(){
+void play_sound(){
     if (seconds_spent < SOUND_SECONDS - 1) {
         PORTE |= 1 << 2;
         _delay_ms(4);
@@ -545,26 +523,15 @@ void check_mode()
     }
 
     switch (chosen_clock) {
-            case NO_CLOCK: 
-                // game_init();
-                break;
             case SEND_RESULT:
                 show_static_time();
                 _delay_ms(50);
                 break;
             case FINISH:
-                play_ERROR();
+                play_sound();
                 break;
             default: break;
     }
-}
-
-void game_init()
-{
-    player_b_min = intervals[interval_index] - 1;
-    player_b_sec = SECONDS_IN_MINUTE - 1;
-    player_a_min = intervals[interval_index] - 1;
-    player_a_sec = SECONDS_IN_MINUTE - 1;
 }
 
 int main()
@@ -576,14 +543,10 @@ int main()
     timer0_init();
     game_init();
 
-    i = 0;
-
     sei();
 
     while (1) {
-        if (!end_of_game) {
-            check_mode();
-        }
+        check_mode();
     }
 
     return 0;
